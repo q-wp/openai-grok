@@ -97,7 +97,6 @@ async function getNextAccount(model, env) {
   const current = ((config.last_cookie_index[model] || 0) + 1) % num;
   config.last_cookie_index[model] = current;
   await setConfig(config, env);
-  // 简化日志输出
   return config.cookies[current];
 }
 
@@ -113,7 +112,7 @@ function getCommonHeaders(cookie) {
   };
 }
 
-/* ========== 检查 cookie 与模型调用限额 ========== */
+/* ========== 检查调用频率 ========== */
 /**
  * 使用指定 cookie 调用 CHECK_URL 接口，返回 JSON 数据（带超时保护）
  */
@@ -131,42 +130,34 @@ async function checkRateLimitWithCookie(model, cookie, isReasoning) {
   if (!response.ok) {
     throw new Error(`Rate limit check failed for model ${model}, status: ${response.status}`);
   }
-  const data = await response.json();
-  return data;
+  return await response.json();
 }
 
 /**
  * 检查单个 cookie 的状态：
  *  - expired：如果用模型 "grok-2" 测试失败，则认为该 cookie 已过期
  *  - 对 MODELS_TO_CHECK 中的模型检查剩余查询次数，返回数组 rateLimitDetails
+ *
+ * 优化：对 "grok-2" 的调用只做一次，作为过期检测及剩余次数检测
  */
 async function checkCookieStatus(cookie) {
-  let expired = false;
-  let rateLimited = false;
   let rateLimitDetails = [];
   try {
-    await checkRateLimitWithCookie("grok-2", cookie, false);
+    // 先测试 grok-2
+    const dataGrok2 = await checkRateLimitWithCookie("grok-2", cookie, false);
+    rateLimitDetails.push({ model: "grok-2", remainingQueries: dataGrok2.remainingQueries });
   } catch (e) {
-    expired = true;
+    return { expired: true, rateLimited: false, rateLimitDetails: [] };
   }
-  if (!expired) {
-    try {
-      rateLimitDetails = await Promise.all(MODELS_TO_CHECK.map(async (model) => {
-        try {
-          const data = await checkRateLimitWithCookie(model, cookie, false);
-          return { model, remainingQueries: data.remainingQueries };
-        } catch (e) {
-          return { model, error: e.toString(), remainingQueries: 0 };
-        }
-      }));
-      if (rateLimitDetails.every(detail => detail.remainingQueries === 0)) {
-        rateLimited = true;
-      }
-    } catch (e) {
-      console.error("Error checking rate limits:", e);
-    }
+  // 再检查 grok-3
+  try {
+    const dataGrok3 = await checkRateLimitWithCookie("grok-3", cookie, false);
+    rateLimitDetails.push({ model: "grok-3", remainingQueries: dataGrok3.remainingQueries });
+  } catch (e) {
+    rateLimitDetails.push({ model: "grok-3", error: e.toString(), remainingQueries: 0 });
   }
-  return { expired, rateLimited, rateLimitDetails };
+  const rateLimited = rateLimitDetails.every(detail => detail.remainingQueries === 0);
+  return { expired: false, rateLimited, rateLimitDetails };
 }
 
 /* ========== 消息预处理 ========== */
@@ -380,104 +371,104 @@ async function sendMessageStream(message, model, disableSearch, forceConcise, is
       headers: { "Content-Type": "application/json" },
     });
   }
-  const { readable, writable } = new TransformStream();
-  const writer = writable.getWriter();
-  const decoder = new TextDecoder();
-  const encoder = new TextEncoder();
-  const reader = response.body.getReader();
 
-  async function pump() {
-    let thinking = 2;
-    let buffer = "";
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      let lines = buffer.split("\n");
-      buffer = lines.pop();
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        try {
-          const data = JSON.parse(trimmed);
-          if (!data?.result?.response || typeof data.result.response.token !== "string") {
-            continue;
-          }
-          let token = data.result.response.token;
-          let content = token;
-          if (isReasoning) {
-            if (thinking === 2) {
-              thinking = 1;
-              content = `<Thinking>\n${token}`;
-            } else if (thinking === 1 && !data.result.response.isThinking) {
-              thinking = 0;
-              content = `\n</Thinking>\n${token}`;
+  // 使用 ReadableStream 优化流数据处理，避免 CPU 占用过高
+  const stream = new ReadableStream({
+    async start(controller) {
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      const encoder = new TextEncoder();
+      let buffer = "";
+      let thinking = 2;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop();
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          try {
+            const data = JSON.parse(trimmed);
+            if (!data?.result?.response || typeof data.result.response.token !== "string") {
+              continue;
             }
-          }
-          const chunkData = {
-            id: "chatcmpl-" + crypto.randomUUID(),
-            object: "chat.completion.chunk",
-            created: Math.floor(Date.now() / 1000),
-            model: model,
-            choices: [
-              { index: 0, delta: { content: content }, finish_reason: null },
-            ],
-          };
-          await writer.write(encoder.encode("data: " + JSON.stringify(chunkData) + "\n\n"));
-          if (data.result.response.isSoftStop) {
-            const finalChunk = {
+            let token = data.result.response.token;
+            let content = token;
+            if (isReasoning) {
+              if (thinking === 2) {
+                thinking = 1;
+                content = `<Thinking>\n${token}`;
+              } else if (thinking === 1 && !data.result.response.isThinking) {
+                thinking = 0;
+                content = `\n</Thinking>\n${token}`;
+              }
+            }
+            const chunkData = {
               id: "chatcmpl-" + crypto.randomUUID(),
               object: "chat.completion.chunk",
               created: Math.floor(Date.now() / 1000),
               model: model,
               choices: [
-                { index: 0, delta: { content: content }, finish_reason: "completed" },
+                { index: 0, delta: { content: content }, finish_reason: null },
               ],
             };
-            await writer.write(encoder.encode("data: " + JSON.stringify(finalChunk) + "\n\n"));
-            writer.close();
-            return;
+            controller.enqueue(encoder.encode("data: " + JSON.stringify(chunkData) + "\n\n"));
+            if (data.result.response.isSoftStop) {
+              const finalChunk = {
+                id: "chatcmpl-" + crypto.randomUUID(),
+                object: "chat.completion.chunk",
+                created: Math.floor(Date.now() / 1000),
+                model: model,
+                choices: [
+                  { index: 0, delta: { content: content }, finish_reason: "completed" },
+                ],
+              };
+              controller.enqueue(encoder.encode("data: " + JSON.stringify(finalChunk) + "\n\n"));
+              controller.close();
+              return;
+            }
+          } catch (e) {
+            console.error("JSON 解析错误:", e, "行内容:", trimmed);
+          }
+        }
+      }
+      if (buffer.trim() !== "") {
+        try {
+          const data = JSON.parse(buffer.trim());
+          if (data?.result?.response && typeof data.result.response.token === "string") {
+            let token = data.result.response.token;
+            let content = token;
+            if (isReasoning) {
+              if (thinking === 2) {
+                thinking = 1;
+                content = `<Thinking>\n${token}`;
+              } else if (thinking === 1 && !data.result.response.isThinking) {
+                thinking = 0;
+                content = `\n</Thinking>\n${token}`;
+              }
+            }
+            const chunkData = {
+              id: "chatcmpl-" + crypto.randomUUID(),
+              object: "chat.completion.chunk",
+              created: Math.floor(Date.now() / 1000),
+              model: model,
+              choices: [
+                { index: 0, delta: { content: content }, finish_reason: null },
+              ],
+            };
+            controller.enqueue(encoder.encode("data: " + JSON.stringify(chunkData) + "\n\n"));
           }
         } catch (e) {
-          console.error("JSON 解析错误:", e, "行内容:", trimmed);
+          console.error("Final JSON parse error:", e, "in buffer:", buffer);
         }
       }
+      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+      controller.close();
     }
-    if (buffer.trim() !== "") {
-      try {
-        const data = JSON.parse(buffer.trim());
-        if (data?.result?.response && typeof data.result.response.token === "string") {
-          let token = data.result.response.token;
-          let content = token;
-          if (isReasoning) {
-            if (thinking === 2) {
-              thinking = 1;
-              content = `<Thinking>\n${token}`;
-            } else if (thinking === 1 && !data.result.response.isThinking) {
-              thinking = 0;
-              content = `\n</Thinking>\n${token}`;
-            }
-          }
-          const chunkData = {
-            id: "chatcmpl-" + crypto.randomUUID(),
-            object: "chat.completion.chunk",
-            created: Math.floor(Date.now() / 1000),
-            model: model,
-            choices: [
-              { index: 0, delta: { content: content }, finish_reason: null },
-            ],
-          };
-          await writer.write(encoder.encode("data: " + JSON.stringify(chunkData) + "\n\n"));
-        }
-      } catch (e) {
-        console.error("Final JSON parse error:", e, "in buffer:", buffer);
-      }
-    }
-    await writer.write(encoder.encode("data: [DONE]\n\n"));
-    writer.close();
-  }
-  pump();
-  return new Response(readable, {
+  });
+  return new Response(stream, {
     headers: { "Content-Type": "text/event-stream" },
   });
 }
